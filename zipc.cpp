@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include <cstdint>
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <unordered_map>
 #include <vector>
 #include <unistd.h>
+#include <sys/mman.h>
 
 // Private definitions
 
@@ -300,13 +302,68 @@ ssize_t zipc_filesize(zipc* handle, const char* path)
 	return v.size;
 }
 
-const void* zipc_map_read(zipc* handle, const char* path, enum zipc_status* err)
+zipc_mapping zipc_map_read(zipc* handle, const char* path, enum zipc_status* err)
 {
 	assert(handle);
 	assert(path);
-	// TBD
+	zipc_mapping m{};
+	if (!handle->fp)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return m;
+	}
+	if (handle->mode == ZIPC_WRITE_ONLY)
+	{
+		if (err) *err = ZIPC_PERMISSION_FAILURE;
+		return m;
+	}
+	auto it = handle->files.find(path);
+	if (it == handle->files.end())
+	{
+		if (err) *err = ZIPC_PATH_NOT_FOUND;
+		return m;
+	}
+
+	const filenode& node = it->second;
+	if (node.size == 0)
+	{
+		static char empty = 0;
+		m.data = &empty;
+		m.size = 0;
+		m.map_base = nullptr;
+		m.map_length = 0;
+		if (err) *err = ZIPC_SUCCESS;
+		return m;
+	}
+
+	const long pagesize_long = sysconf(_SC_PAGESIZE);
+	const size_t pagesize = pagesize_long > 0 ? (size_t)pagesize_long : 4096;
+	const size_t page_offset = node.data_offset % pagesize;
+	const size_t map_offset = node.data_offset - page_offset;
+	const size_t map_length = node.size + page_offset;
+
+	const int fd = fileno(handle->fp);
+	if (fd < 0)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return m;
+	}
+
+	void* base = mmap(nullptr, map_length, PROT_READ, MAP_PRIVATE, fd, (off_t)map_offset);
+	if (base == MAP_FAILED)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return m;
+	}
+
+	void* user_ptr = static_cast<unsigned char*>(base) + page_offset;
+	m.data = user_ptr;
+	m.size = node.size;
+	m.map_base = base;
+	m.map_length = map_length;
+
 	if (err) *err = ZIPC_SUCCESS;
-	return nullptr;
+	return m;
 }
 
 void* zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size_t max)
@@ -318,10 +375,12 @@ void* zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size
 	return nullptr;
 }
 
-void zipc_unmap(zipc* handle, void* ptr)
+void zipc_unmap(zipc* handle, zipc_mapping mapping)
 {
 	assert(handle);
-	// TBD
+	(void)handle;
+	if (!mapping.map_base || mapping.map_length == 0) return;
+	munmap(const_cast<void*>(mapping.map_base), mapping.map_length);
 }
 
 enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const void* ptr)

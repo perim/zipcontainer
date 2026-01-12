@@ -35,11 +35,19 @@ void zipc_close(zipc* handle);
 /// file is not found. This function is thread-safe.
 ssize_t zipc_filesize(zipc* handle, const char* path);
 
+struct zipc_mapping
+{
+	const void* data;      // Pointer to file contents (read-only).
+	size_t size;           // Size of the file data.
+	const void* map_base;  // Base address of the mapping.
+	size_t map_length;     // Length passed to mmap().
+};
+
 /// Memory map a file inside the ZIP container for streaming read. Read once and then
 /// unmap it. The whole file will be mapped, get the size of the file with `zipc_filesize`.
 /// If `err` is not null, we will write status to it. This function is thread-safe.
-/// Returns null on failure.
-const void* zipc_map_read(zipc* handle, const char* path, enum zipc_status* err);
+/// Returns a struct describing the mapping; `data` will be null on failure.
+zipc_mapping zipc_map_read(zipc* handle, const char* path, enum zipc_status* err);
 
 /// Memory map to a new file inside the ZIP container for streaming write. `path` must
 /// not already exist in the container. You must not write to the ZIP file in any other
@@ -49,8 +57,9 @@ const void* zipc_map_read(zipc* handle, const char* path, enum zipc_status* err)
 /// do not use the full UINT64_MAX. Returns null on failure.
 void* zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size_t max);
 
-/// Unmap the memory mapped by `zipc_map_<type>`. This function is thread-safe.
-void zipc_unmap(zipc* handle, void* ptr);
+/// Unmap the memory mapped by `zipc_map_<type>`. Pass the mapping returned from
+/// `zipc_map_read`. This function is thread-safe.
+void zipc_unmap(zipc* handle, zipc_mapping mapping);
 
 /// Create and write a new file inside the ZIP container.
 enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const void* ptr);

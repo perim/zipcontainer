@@ -34,10 +34,13 @@ int main(int argc, char** argv)
 	r = zipc_read(z, internal_filename, strlen(content), readback);
 	assert(r == ZIPC_SUCCESS);
 	assert(strncmp(content, readback, strlen(content)) == 0);
-	char* m = (char*)zipc_map_read(z, internal_filename, &r);
+	zipc_mapping map = zipc_map_read(z, internal_filename, &r);
 	assert(r == ZIPC_SUCCESS);
-	//TBD assert(strncmp(content, m, strlen(content)) == 0);
-	zipc_unmap(z, m);
+	assert(map.data);
+	assert(map.size == strlen(content));
+	assert(strncmp(content, (const char*)map.data, map.size) == 0);
+	assert(((const char*)map.data)[map.size - 1] == content[strlen(content) - 1]);
+	zipc_unmap(z, map);
 	zipc_close(z);
 
 	// TBD test zipc_map with write mode
