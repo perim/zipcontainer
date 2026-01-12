@@ -58,12 +58,50 @@ static uint32_t crc32_calc(const void* data, size_t size)
 	return crc ^ 0xFFFFFFFFU;
 }
 
+// Write all bytes even if fwrite returns short. Fail only on persistent error.
+static bool write_all(FILE* fp, const void* buf, size_t size)
+{
+	const unsigned char* p = static_cast<const unsigned char*>(buf);
+	size_t remaining = size;
+	while (remaining > 0)
+	{
+		size_t w = fwrite(p, 1, remaining, fp);
+		if (w == 0)
+		{
+			if (ferror(fp)) return false;
+			continue;
+		}
+		p += w;
+		remaining -= w;
+	}
+	return true;
+}
+
+// Read exactly size bytes; fail on EOF or error.
+static bool read_fully(FILE* fp, void* buf, size_t size)
+{
+	unsigned char* p = static_cast<unsigned char*>(buf);
+	size_t remaining = size;
+	while (remaining > 0)
+	{
+		size_t r = fread(p, 1, remaining, fp);
+		if (r == 0)
+		{
+			if (ferror(fp) || feof(fp)) return false;
+			continue;
+		}
+		p += r;
+		remaining -= r;
+	}
+	return true;
+}
+
 static bool write_empty_archive(FILE* fp)
 {
 	static const unsigned char eocd[22] = {0x50, 0x4b, 0x05, 0x06,
 		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 	if (fseek(fp, 0, SEEK_SET) != 0) return false;
-	if (fwrite(eocd, 1, sizeof(eocd), fp) != sizeof(eocd)) return false;
+	if (!write_all(fp, eocd, sizeof(eocd))) return false;
 	return fflush(fp) == 0;
 }
 
@@ -71,7 +109,7 @@ static bool compute_data_offset(FILE* fp, uint32_t local_offset, size_t* data_of
 {
 	if (fseek(fp, local_offset, SEEK_SET) != 0) return false;
 	unsigned char local[30];
-	if (fread(local, 1, sizeof(local), fp) != sizeof(local)) return false;
+	if (!read_fully(fp, local, sizeof(local))) return false;
 	if (read_le32(local) != 0x04034b50) return false;
 	const uint16_t name_len = read_le16(local + 26);
 	const uint16_t extra_len = read_le16(local + 28);
@@ -119,7 +157,7 @@ static enum zipc_status load_existing_archive(zipc* z)
 
 	std::vector<unsigned char> tail(search);
 	if (fseek(fp, file_size - static_cast<long>(search), SEEK_SET) != 0) return ZIPC_IO_FAILURE;
-	if (fread(tail.data(), 1, search, fp) != search) return ZIPC_IO_FAILURE;
+	if (!read_fully(fp, tail.data(), search)) return ZIPC_IO_FAILURE;
 
 	ssize_t eocd_idx = -1;
 	for (size_t i = search - 22;; --i)
@@ -144,7 +182,7 @@ static enum zipc_status load_existing_archive(zipc* z)
 	std::vector<unsigned char> header(46);
 	for (uint16_t i = 0; i < entry_count; ++i)
 	{
-		if (fread(header.data(), 1, header.size(), fp) != header.size()) return ZIPC_CORRUPT_ARCHIVE;
+		if (!read_fully(fp, header.data(), header.size())) return ZIPC_CORRUPT_ARCHIVE;
 		if (read_le32(header.data()) != 0x02014b50) return ZIPC_CORRUPT_ARCHIVE;
 
 		const uint16_t flags = read_le16(header.data() + 8);
@@ -162,7 +200,7 @@ static enum zipc_status load_existing_archive(zipc* z)
 		if (compressed_size != uncompressed_size) return ZIPC_UNSUPPORTED_FEATURE;
 
 		std::string name(name_len, '\0');
-		if (fread(name.data(), 1, name_len, fp) != name_len) return ZIPC_CORRUPT_ARCHIVE;
+		if (!read_fully(fp, name.data(), name_len)) return ZIPC_CORRUPT_ARCHIVE;
 		if (fseek(fp, extra_len + comment_len, SEEK_CUR) != 0) return ZIPC_CORRUPT_ARCHIVE;
 
 		size_t data_offset = 0;
@@ -340,9 +378,9 @@ enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const v
 	local[27] = (unsigned char)((name_len >> 8) & 0xFF);
 	// extra length 0
 
-	if (fwrite(local, 1, sizeof(local), handle->fp) != sizeof(local)) return ZIPC_IO_FAILURE;
-	if (fwrite(path, 1, name_len, handle->fp) != name_len) return ZIPC_IO_FAILURE;
-	if (size > 0 && fwrite(ptr, 1, size, handle->fp) != size) return ZIPC_IO_FAILURE;
+	if (!write_all(handle->fp, local, sizeof(local))) return ZIPC_IO_FAILURE;
+	if (!write_all(handle->fp, path, name_len)) return ZIPC_IO_FAILURE;
+	if (size > 0 && !write_all(handle->fp, ptr, size)) return ZIPC_IO_FAILURE;
 
 	filenode node;
 	node.size = size;
@@ -397,8 +435,8 @@ enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const v
 		cd[44] = (unsigned char)((loc >> 16) & 0xFF);
 		cd[45] = (unsigned char)((loc >> 24) & 0xFF);
 
-		if (fwrite(cd, 1, sizeof(cd), handle->fp) != sizeof(cd)) return ZIPC_IO_FAILURE;
-		if (fwrite(name.data(), 1, nlen, handle->fp) != nlen) return ZIPC_IO_FAILURE;
+		if (!write_all(handle->fp, cd, sizeof(cd))) return ZIPC_IO_FAILURE;
+		if (!write_all(handle->fp, name.data(), nlen)) return ZIPC_IO_FAILURE;
 	}
 
 	const long cd_end_long = ftell(handle->fp);
@@ -423,7 +461,7 @@ enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const v
 	eocd[19] = (unsigned char)((cd_start >> 24) & 0xFF);
 	// comment length 0
 
-	if (fwrite(eocd, 1, sizeof(eocd), handle->fp) != sizeof(eocd)) return ZIPC_IO_FAILURE;
+	if (!write_all(handle->fp, eocd, sizeof(eocd))) return ZIPC_IO_FAILURE;
 	if (fflush(handle->fp) != 0) return ZIPC_IO_FAILURE;
 
 	handle->central_dir_offset = cd_start;
@@ -444,7 +482,7 @@ enum zipc_status zipc_read(zipc* handle, const char* path, size_t size, void* pt
 	const filenode& node = handle->files.at(path);
 	if (size > node.size) return ZIPC_SYNTAX_ERROR;
 	if (fseek(handle->fp, (long)node.data_offset, SEEK_SET) != 0) return ZIPC_IO_FAILURE;
-	if (size > 0 && fread(ptr, 1, size, handle->fp) != size) return ZIPC_IO_FAILURE;
+	if (size > 0 && !read_fully(handle->fp, ptr, size)) return ZIPC_IO_FAILURE;
 	return ZIPC_SUCCESS;
 }
 
