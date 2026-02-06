@@ -42,6 +42,7 @@ int main(int argc, char** argv)
 	assert(strncmp(content, (const char*)map.data, map.size) == 0);
 	assert(((const char*)map.data)[map.size - 1] == content[strlen(content) - 1]);
 	zipc_unmap(z, map);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	zipc_close(z);
 
 	// Test existing zip files
@@ -54,6 +55,7 @@ int main(int argc, char** argv)
 	assert(size != -1);
 	size = zipc_filesize(z, "third.txt");
 	assert(size != -1);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	assert(r == ZIPC_SUCCESS);
 	assert(z);
 	zipc_close(z);
@@ -68,6 +70,7 @@ int main(int argc, char** argv)
 	assert(size != -1);
 	size = zipc_filesize(z, "third.txt");
 	assert(size != -1);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	assert(r == ZIPC_SUCCESS);
 	assert(z);
 	zipc_close(z);

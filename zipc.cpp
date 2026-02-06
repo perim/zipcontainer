@@ -32,7 +32,7 @@ static uint32_t read_le32(const unsigned char* ptr)
 	return (uint32_t)ptr[0] | ((uint32_t)ptr[1] << 8U) | ((uint32_t)ptr[2] << 16U) | ((uint32_t)ptr[3] << 24U);
 }
 
-static uint32_t crc32_calc(const void* data, size_t size)
+static const uint32_t* crc32_table()
 {
 	static uint32_t table[256];
 	static bool table_init = false;
@@ -50,13 +50,24 @@ static uint32_t crc32_calc(const void* data, size_t size)
 		}
 		table_init = true;
 	}
+	return table;
+}
 
-	uint32_t crc = 0xFFFFFFFFU;
+static uint32_t crc32_update(uint32_t crc, const void* data, size_t size)
+{
+	const uint32_t* table = crc32_table();
 	const unsigned char* p = static_cast<const unsigned char*>(data);
 	for (size_t i = 0; i < size; ++i)
 	{
 		crc = table[(crc ^ p[i]) & 0xFFU] ^ (crc >> 8U);
 	}
+	return crc;
+}
+
+static uint32_t crc32_calc(const void* data, size_t size)
+{
+	uint32_t crc = 0xFFFFFFFFU;
+	crc = crc32_update(crc, data, size);
 	return crc ^ 0xFFFFFFFFU;
 }
 
@@ -550,7 +561,8 @@ zipcstream* zipc_stream_open(zipc* handle, const char* path, const char* mode, e
 	assert(handle);
 	assert(path);
 	zipcstream* c = new zipcstream();
-	// TBD
+	// TBD squash any file path in `path` for our temp file, don't want to create any temp dir mess
+	// TBD we need to make the temp files on the same device as the zipc file or we'll fail to zero-copy the contents on close
 	if (err) *err = ZIPC_SUCCESS;
 	return c;
 }
@@ -567,7 +579,89 @@ enum zipc_status zipc_stream_close(zipc* handle, zipcstream* stream)
 {
 	assert(handle);
 	assert(stream);
-	// TBD use sendfile() to efficiently move temporary file into ZIP
+
+	// TBD use copy_file_range() to move file chunks without kernel overhead, then use fallocate() to punch holes in the source
+	// file so that we can temporarily duplicate the files without doubling disk space usage
+	// ssize_t copy_file_range(int fd_in, off_t *_Nullable off_in, int fd_out, off_t *_Nullable off_out, size_t size, unsigned int flags);
+
+	// TBD delete source file
+
 	delete stream;
+	return ZIPC_SUCCESS;
+}
+
+enum zipc_status zipc_validate(zipc* handle)
+{
+	assert(handle);
+	if (!handle) return ZIPC_SYNTAX_ERROR;
+	if (!handle->fp) return ZIPC_IO_FAILURE;
+	if (!handle->central_dir_known) return ZIPC_CORRUPT_ARCHIVE;
+
+	if (fseek(handle->fp, 0, SEEK_END) != 0) return ZIPC_IO_FAILURE;
+	const long file_size_long = ftell(handle->fp);
+	if (file_size_long < 0) return ZIPC_IO_FAILURE;
+	const size_t file_size = (size_t)file_size_long;
+	if (handle->central_dir_offset > file_size) return ZIPC_CORRUPT_ARCHIVE;
+
+	std::vector<unsigned char> local(30);
+	std::vector<unsigned char> buf(64 * 1024);
+
+	for (const auto& kv : handle->files)
+	{
+		const std::string& name = kv.first;
+		const filenode& node = kv.second;
+
+		if (node.local_offset + local.size() > file_size) return ZIPC_CORRUPT_ARCHIVE;
+		if (fseek(handle->fp, (long)node.local_offset, SEEK_SET) != 0) return ZIPC_IO_FAILURE;
+		if (!read_fully(handle->fp, local.data(), local.size())) return ZIPC_IO_FAILURE;
+		if (read_le32(local.data()) != 0x04034b50) return ZIPC_CORRUPT_ARCHIVE;
+
+		const uint16_t flags = read_le16(local.data() + 6);
+		const uint16_t method = read_le16(local.data() + 8);
+		const uint32_t crc = read_le32(local.data() + 14);
+		const uint32_t compressed_size = read_le32(local.data() + 18);
+		const uint32_t uncompressed_size = read_le32(local.data() + 22);
+		const uint16_t name_len = read_le16(local.data() + 26);
+		const uint16_t extra_len = read_le16(local.data() + 28);
+
+		if (method != 0) return ZIPC_UNSUPPORTED_FEATURE;
+		if (flags & 0x08) return ZIPC_UNSUPPORTED_FEATURE;
+		if (compressed_size != uncompressed_size) return ZIPC_UNSUPPORTED_FEATURE;
+		if (name_len != name.size()) return ZIPC_CORRUPT_ARCHIVE;
+		if (node.size != uncompressed_size) return ZIPC_CORRUPT_ARCHIVE;
+		if (node.crc != crc) return ZIPC_CORRUPT_ARCHIVE;
+
+		std::string name_on_disk(name_len, '\0');
+		if (!read_fully(handle->fp, name_on_disk.data(), name_len)) return ZIPC_IO_FAILURE;
+		if (name_on_disk != name) return ZIPC_CORRUPT_ARCHIVE;
+		if (fseek(handle->fp, extra_len, SEEK_CUR) != 0) return ZIPC_IO_FAILURE;
+
+		const size_t data_offset = (size_t)node.local_offset + 30U + name_len + extra_len;
+		if (data_offset != node.data_offset) return ZIPC_CORRUPT_ARCHIVE;
+		if (node.size > file_size) return ZIPC_CORRUPT_ARCHIVE;
+		if (data_offset > file_size - node.size) return ZIPC_CORRUPT_ARCHIVE;
+		if (handle->central_dir_offset > 0)
+		{
+			if (node.size > handle->central_dir_offset) return ZIPC_CORRUPT_ARCHIVE;
+			if (data_offset > handle->central_dir_offset - node.size) return ZIPC_CORRUPT_ARCHIVE;
+		}
+
+		uint32_t crc_calc = 0xFFFFFFFFU;
+		if (node.size > 0)
+		{
+			if (fseek(handle->fp, (long)data_offset, SEEK_SET) != 0) return ZIPC_IO_FAILURE;
+			size_t remaining = node.size;
+			while (remaining > 0)
+			{
+				const size_t chunk = remaining < buf.size() ? remaining : buf.size();
+				if (!read_fully(handle->fp, buf.data(), chunk)) return ZIPC_IO_FAILURE;
+				crc_calc = crc32_update(crc_calc, buf.data(), chunk);
+				remaining -= chunk;
+			}
+		}
+		crc_calc ^= 0xFFFFFFFFU;
+		if (crc_calc != node.crc) return ZIPC_CORRUPT_ARCHIVE;
+	}
+
 	return ZIPC_SUCCESS;
 }

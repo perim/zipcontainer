@@ -19,7 +19,6 @@ enum zipc_status
 	ZIPC_CORRUPT_ARCHIVE,
 	ZIPC_UNSUPPORTED_FEATURE,
 	ZIPC_PATH_NOT_FOUND,
-	// TBD many more here
 };
 
 /// Open an uncompressed ZIP file. Mode is 'r' for reading, 'w' for writing (replacing
@@ -34,6 +33,10 @@ void zipc_close(zipc* handle);
 /// Obtain the filesize of a given file inside the ZIP container. Return -1 if the
 /// file is not found. This function is thread-safe.
 ssize_t zipc_filesize(zipc* handle, const char* path);
+
+/// Validate the zip container and its contents. Returns ZIPC_SUCCESS if the container and its
+/// contents look undamaged, otherwise a reason for failure.
+enum zipc_status zipc_validate(zipc* handle);
 
 struct zipc_mapping
 {
