@@ -45,6 +45,40 @@ int main(int argc, char** argv)
 	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	zipc_close(z);
 
+	// Stream write zip file
+	const char* stream_zip_filename = "streamfile.zip";
+	z = zipc_open(stream_zip_filename, "w", &r);
+	assert(r == ZIPC_SUCCESS);
+	assert(z);
+	zipcstream* stream = zipc_stream_open(z, "stream.txt", "", &r);
+	assert(r == ZIPC_SUCCESS);
+	assert(stream);
+	const char* part1 = "Stream ";
+	const char* part2 = "write test";
+	r = zipc_stream_write(z, stream, strlen(part1), part1);
+	assert(r == ZIPC_SUCCESS);
+	r = zipc_stream_write(z, stream, strlen(part2), part2);
+	assert(r == ZIPC_SUCCESS);
+	r = zipc_stream_close(z, stream);
+	assert(r == ZIPC_SUCCESS);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
+	stream = zipc_stream_open(z, "stream.txt", "", &r);
+	assert(stream == nullptr);
+	assert(r == ZIPC_PATH_ALREADY_EXISTS);
+	zipc_close(z);
+
+	z = zipc_open(stream_zip_filename, "r", &r);
+	assert(r == ZIPC_SUCCESS);
+	assert(z);
+	const char* full_stream = "Stream write test";
+	char stream_readback[128];
+	memset(stream_readback, 0, sizeof(stream_readback));
+	r = zipc_read(z, "stream.txt", strlen(full_stream), stream_readback);
+	assert(r == ZIPC_SUCCESS);
+	assert(strncmp(full_stream, stream_readback, strlen(full_stream)) == 0);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
+	zipc_close(z);
+
 	// Test existing zip files
 	z = zipc_open(TEXT_FILES_ZIP, "r", &r);
 	assert(z);

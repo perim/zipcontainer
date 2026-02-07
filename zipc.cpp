@@ -13,6 +13,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 
+extern "C" ssize_t copy_file_range(int fd_in, off_t* off_in, int fd_out, off_t* off_out, size_t len, unsigned int flags);
+
 // Private definitions
 
 enum zipc_mode
@@ -45,6 +47,8 @@ struct zipcstream
 	zipc* parent = nullptr;
 	FILE* stream = nullptr;
 	std::string path;
+	std::string temp_path;
+	size_t size = 0;
 };
 
 // Utility functions
@@ -155,6 +159,94 @@ static bool compute_data_offset(FILE* fp, uint32_t local_offset, size_t* data_of
 	const uint16_t extra_len = read_le16(local + 28);
 	*data_offset = static_cast<size_t>(local_offset) + 30U + name_len + extra_len;
 	return true;
+}
+
+static enum zipc_status write_central_directory(zipc* handle)
+{
+	assert(handle);
+	if (!handle->fp) return ZIPC_IO_FAILURE;
+
+	std::vector<std::string> names;
+	names.reserve(handle->files.size());
+	for (const auto& kv : handle->files) names.push_back(kv.first);
+	std::sort(names.begin(), names.end());
+
+	const long cd_start_long = ftell(handle->fp);
+	if (cd_start_long < 0) return ZIPC_IO_FAILURE;
+	if (cd_start_long > 0xFFFFFFFFL) return ZIPC_UNSUPPORTED_FEATURE;
+	const uint32_t cd_start = (uint32_t)cd_start_long;
+
+	for (const auto& name : names)
+	{
+		const filenode& n = handle->files.at(name);
+		if (n.size > 0xFFFFFFFFULL) return ZIPC_UNSUPPORTED_FEATURE;
+		if (name.size() > 0xFFFF) return ZIPC_UNSUPPORTED_FEATURE;
+
+		unsigned char cd[46] = {0};
+		cd[0] = 0x50; cd[1] = 0x4b; cd[2] = 0x01; cd[3] = 0x02;
+		cd[4] = 20; cd[5] = 0; // version made by
+		cd[6] = 20; cd[7] = 0; // version needed to extract
+		// flags: 0
+		// compression: 0
+		// mod time/date: 0
+		cd[16] = (unsigned char)(n.crc & 0xFF);
+		cd[17] = (unsigned char)((n.crc >> 8) & 0xFF);
+		cd[18] = (unsigned char)((n.crc >> 16) & 0xFF);
+		cd[19] = (unsigned char)((n.crc >> 24) & 0xFF);
+
+		const uint32_t sz32 = (uint32_t)n.size;
+		cd[20] = (unsigned char)(sz32 & 0xFF);
+		cd[21] = (unsigned char)((sz32 >> 8) & 0xFF);
+		cd[22] = (unsigned char)((sz32 >> 16) & 0xFF);
+		cd[23] = (unsigned char)((sz32 >> 24) & 0xFF);
+		cd[24] = cd[20];
+		cd[25] = cd[21];
+		cd[26] = cd[22];
+		cd[27] = cd[23];
+
+		const uint16_t nlen = (uint16_t)name.size();
+		cd[28] = (unsigned char)(nlen & 0xFF);
+		cd[29] = (unsigned char)((nlen >> 8) & 0xFF);
+		// extra len 0, comment len 0, disk start 0, int/ext attrs 0
+		const uint32_t loc = n.local_offset;
+		cd[42] = (unsigned char)(loc & 0xFF);
+		cd[43] = (unsigned char)((loc >> 8) & 0xFF);
+		cd[44] = (unsigned char)((loc >> 16) & 0xFF);
+		cd[45] = (unsigned char)((loc >> 24) & 0xFF);
+
+		if (!write_all(handle->fp, cd, sizeof(cd))) return ZIPC_IO_FAILURE;
+		if (!write_all(handle->fp, name.data(), nlen)) return ZIPC_IO_FAILURE;
+	}
+
+	const long cd_end_long = ftell(handle->fp);
+	if (cd_end_long < 0) return ZIPC_IO_FAILURE;
+	const uint32_t cd_size = (uint32_t)(cd_end_long - (long)cd_start);
+	if (names.size() > 0xFFFF) return ZIPC_UNSUPPORTED_FEATURE;
+	const uint16_t entry_count = (uint16_t)names.size();
+
+	unsigned char eocd[22] = {0};
+	eocd[0] = 0x50; eocd[1] = 0x4b; eocd[2] = 0x05; eocd[3] = 0x06;
+	// disk numbers 0
+	eocd[8] = (unsigned char)(entry_count & 0xFF);
+	eocd[9] = (unsigned char)((entry_count >> 8) & 0xFF);
+	eocd[10] = eocd[8];
+	eocd[11] = eocd[9];
+	eocd[12] = (unsigned char)(cd_size & 0xFF);
+	eocd[13] = (unsigned char)((cd_size >> 8) & 0xFF);
+	eocd[14] = (unsigned char)((cd_size >> 16) & 0xFF);
+	eocd[15] = (unsigned char)((cd_size >> 24) & 0xFF);
+	eocd[16] = (unsigned char)(cd_start & 0xFF);
+	eocd[17] = (unsigned char)((cd_start >> 8) & 0xFF);
+	eocd[18] = (unsigned char)((cd_start >> 16) & 0xFF);
+	eocd[19] = (unsigned char)((cd_start >> 24) & 0xFF);
+	// comment length 0
+
+	if (!write_all(handle->fp, eocd, sizeof(eocd))) return ZIPC_IO_FAILURE;
+	if (fflush(handle->fp) != 0) return ZIPC_IO_FAILURE;
+
+	handle->central_dir_offset = cd_start;
+	handle->central_dir_known = true;
+	return ZIPC_SUCCESS;
 }
 
 static enum zipc_status load_existing_archive(zipc* z)
@@ -479,85 +571,7 @@ enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const v
 	node.crc = crc;
 	handle->files.emplace(path, node);
 
-	// Rewrite central directory with all entries
-	std::vector<std::string> names;
-	names.reserve(handle->files.size());
-	for (const auto& kv : handle->files) names.push_back(kv.first);
-	std::sort(names.begin(), names.end());
-
-	const long cd_start_long = ftell(handle->fp);
-	if (cd_start_long < 0) return ZIPC_IO_FAILURE;
-	uint32_t cd_start = (uint32_t)cd_start_long;
-
-	for (const auto& name : names)
-	{
-		const filenode& n = handle->files.at(name);
-		if (n.size > 0xFFFFFFFFULL) return ZIPC_UNSUPPORTED_FEATURE;
-		unsigned char cd[46] = {0};
-		cd[0] = 0x50; cd[1] = 0x4b; cd[2] = 0x01; cd[3] = 0x02;
-		cd[4] = 20; cd[5] = 0; // version made by
-		cd[6] = 20; cd[7] = 0; // version needed to extract
-		// flags: 0
-		// compression: 0
-		// mod time/date: 0
-		cd[16] = (unsigned char)(n.crc & 0xFF);
-		cd[17] = (unsigned char)((n.crc >> 8) & 0xFF);
-		cd[18] = (unsigned char)((n.crc >> 16) & 0xFF);
-		cd[19] = (unsigned char)((n.crc >> 24) & 0xFF);
-
-		const uint32_t sz32 = (uint32_t)n.size;
-		cd[20] = (unsigned char)(sz32 & 0xFF);
-		cd[21] = (unsigned char)((sz32 >> 8) & 0xFF);
-		cd[22] = (unsigned char)((sz32 >> 16) & 0xFF);
-		cd[23] = (unsigned char)((sz32 >> 24) & 0xFF);
-		cd[24] = cd[20];
-		cd[25] = cd[21];
-		cd[26] = cd[22];
-		cd[27] = cd[23];
-
-		const uint16_t nlen = (uint16_t)name.size();
-		cd[28] = (unsigned char)(nlen & 0xFF);
-		cd[29] = (unsigned char)((nlen >> 8) & 0xFF);
-		// extra len 0, comment len 0, disk start 0, int/ext attrs 0
-		const uint32_t loc = n.local_offset;
-		cd[42] = (unsigned char)(loc & 0xFF);
-		cd[43] = (unsigned char)((loc >> 8) & 0xFF);
-		cd[44] = (unsigned char)((loc >> 16) & 0xFF);
-		cd[45] = (unsigned char)((loc >> 24) & 0xFF);
-
-		if (!write_all(handle->fp, cd, sizeof(cd))) return ZIPC_IO_FAILURE;
-		if (!write_all(handle->fp, name.data(), nlen)) return ZIPC_IO_FAILURE;
-	}
-
-	const long cd_end_long = ftell(handle->fp);
-	if (cd_end_long < 0) return ZIPC_IO_FAILURE;
-	const uint32_t cd_size = (uint32_t)(cd_end_long - (long)cd_start);
-	const uint16_t entry_count = (uint16_t)names.size();
-
-	unsigned char eocd[22] = {0};
-	eocd[0] = 0x50; eocd[1] = 0x4b; eocd[2] = 0x05; eocd[3] = 0x06;
-	// disk numbers 0
-	eocd[8] = (unsigned char)(entry_count & 0xFF);
-	eocd[9] = (unsigned char)((entry_count >> 8) & 0xFF);
-	eocd[10] = eocd[8];
-	eocd[11] = eocd[9];
-	eocd[12] = (unsigned char)(cd_size & 0xFF);
-	eocd[13] = (unsigned char)((cd_size >> 8) & 0xFF);
-	eocd[14] = (unsigned char)((cd_size >> 16) & 0xFF);
-	eocd[15] = (unsigned char)((cd_size >> 24) & 0xFF);
-	eocd[16] = (unsigned char)(cd_start & 0xFF);
-	eocd[17] = (unsigned char)((cd_start >> 8) & 0xFF);
-	eocd[18] = (unsigned char)((cd_start >> 16) & 0xFF);
-	eocd[19] = (unsigned char)((cd_start >> 24) & 0xFF);
-	// comment length 0
-
-	if (!write_all(handle->fp, eocd, sizeof(eocd))) return ZIPC_IO_FAILURE;
-	if (fflush(handle->fp) != 0) return ZIPC_IO_FAILURE;
-
-	handle->central_dir_offset = cd_start;
-	handle->central_dir_known = true;
-
-	return ZIPC_SUCCESS;
+	return write_central_directory(handle);
 }
 
 enum zipc_status zipc_read(zipc* handle, const char* path, size_t size, void* ptr)
@@ -580,14 +594,78 @@ zipcstream* zipc_stream_open(zipc* handle, const char* path, const char* mode, e
 {
 	assert(handle);
 	assert(path);
+	if (err) *err = ZIPC_SUCCESS;
+	if (!handle || !path || !mode)
+	{
+		if (err) *err = ZIPC_SYNTAX_ERROR;
+		return nullptr;
+	}
+	if (mode[0] != '\0')
+	{
+		if (err) *err = ZIPC_UNSUPPORTED_FEATURE;
+		return nullptr;
+	}
+	if (handle->mode == ZIPC_READ_ONLY)
+	{
+		if (err) *err = ZIPC_PERMISSION_FAILURE;
+		return nullptr;
+	}
+	if (!handle->fp)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return nullptr;
+	}
+	if (handle->files.count(path) != 0)
+	{
+		if (err) *err = ZIPC_PATH_ALREADY_EXISTS;
+		return nullptr;
+	}
+
+	const std::string& filename = handle->filename;
+	const size_t slash = filename.find_last_of('/');
+	std::string dir;
+	if (slash == std::string::npos)
+	{
+		dir = ".";
+	}
+	else if (slash == 0)
+	{
+		dir = "/";
+	}
+	else
+	{
+		dir = filename.substr(0, slash);
+	}
+
+	std::string tmpl;
+	if (dir == "/") tmpl = "/.zipc_tmp_XXXXXX";
+	else tmpl = dir + "/.zipc_tmp_XXXXXX";
+
+	std::vector<char> buf(tmpl.begin(), tmpl.end());
+	buf.push_back('\0');
+
+	const int fd = mkstemp(buf.data());
+	if (fd < 0)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return nullptr;
+	}
+
+	FILE* fp = fdopen(fd, "wb+");
+	if (!fp)
+	{
+		close(fd);
+		unlink(buf.data());
+		if (err) *err = ZIPC_IO_FAILURE;
+		return nullptr;
+	}
+
 	zipcstream* c = new zipcstream();
 	c->parent = handle;
+	c->stream = fp;
 	c->path = path;
-
-	// TBD maybe squash any file path in `path` to create our temp filename, don't want to create any temp dir mess
-	// TBD we need to make the temp files on the same device as the zipc file or we'll fail to zero-copy the contents on close
-
-	if (err) *err = ZIPC_SUCCESS;
+	c->temp_path = buf.data();
+	c->size = 0;
 	return c;
 }
 
@@ -595,9 +673,22 @@ enum zipc_status zipc_stream_write(const zipc* handle, zipcstream* stream, size_
 {
 	assert(handle);
 	assert(stream);
-	assert(size > 0);
-	assert(ptr);
-	// TBD
+	if (!handle || !stream) return ZIPC_SYNTAX_ERROR;
+	if (stream->parent != handle)
+	{
+		if (stream->stream) fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_SYNTAX_ERROR;
+	}
+	if (handle->mode == ZIPC_READ_ONLY) return ZIPC_PERMISSION_FAILURE;
+	if (!stream->stream) return ZIPC_IO_FAILURE;
+	if (!ptr && size > 0) return ZIPC_SYNTAX_ERROR;
+	if (stream->path.empty()) return ZIPC_SYNTAX_ERROR;
+	if (size == 0) return ZIPC_SUCCESS;
+
+	if (!write_all(stream->stream, ptr, size)) return ZIPC_IO_FAILURE;
+	stream->size += size;
 	return ZIPC_SUCCESS;
 }
 
@@ -606,14 +697,257 @@ enum zipc_status zipc_stream_close(zipc* handle, zipcstream* stream)
 	assert(handle);
 	assert(stream);
 
-	// TBD use copy_file_range() to move file chunks without kernel overhead, then use fallocate() to punch holes in the source
-	// file so that we can temporarily duplicate the files without doubling disk space usage
-	// ssize_t copy_file_range(int fd_in, off_t *_Nullable off_in, int fd_out, off_t *_Nullable off_out, size_t size, unsigned int flags);
+	if (!handle || !stream) return ZIPC_SYNTAX_ERROR;
+	if (handle->mode == ZIPC_READ_ONLY)
+	{
+		if (stream->stream) fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_PERMISSION_FAILURE;
+	}
+	if (!handle->fp || !stream->stream)
+	{
+		if (stream->stream) fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (stream->path.empty())
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_SYNTAX_ERROR;
+	}
+	if (handle->files.count(stream->path) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_PATH_ALREADY_EXISTS;
+	}
 
-	// TBD delete source file
+	if (fflush(stream->stream) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (fseek(stream->stream, 0, SEEK_END) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	const long size_long = ftell(stream->stream);
+	if (size_long < 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	const size_t data_size = (size_t)size_long;
+	if (stream->size != data_size)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (data_size > 0xFFFFFFFFULL)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_UNSUPPORTED_FEATURE;
+	}
+	const size_t name_len = stream->path.size();
+	if (name_len > 0xFFFF)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_UNSUPPORTED_FEATURE;
+	}
+	if (fseek(stream->stream, 0, SEEK_SET) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
 
+	uint32_t crc = 0xFFFFFFFFU;
+	std::vector<unsigned char> buf(64 * 1024);
+	size_t remaining = data_size;
+	while (remaining > 0)
+	{
+		const size_t chunk = remaining < buf.size() ? remaining : buf.size();
+		if (!read_fully(stream->stream, buf.data(), chunk))
+		{
+			fclose(stream->stream);
+			if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+			delete stream;
+			return ZIPC_IO_FAILURE;
+		}
+		crc = crc32_update(crc, buf.data(), chunk);
+		remaining -= chunk;
+	}
+	crc ^= 0xFFFFFFFFU;
+	if (fseek(stream->stream, 0, SEEK_SET) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+
+	if (handle->central_dir_known)
+	{
+		if (fseek(handle->fp, (long)handle->central_dir_offset, SEEK_SET) != 0)
+		{
+			fclose(stream->stream);
+			if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+			delete stream;
+			return ZIPC_IO_FAILURE;
+		}
+		const int fd = fileno(handle->fp);
+		if (fd >= 0 && ftruncate(fd, (off_t)handle->central_dir_offset) != 0)
+		{
+			fclose(stream->stream);
+			if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+			delete stream;
+			return ZIPC_IO_FAILURE;
+		}
+	}
+	else if (fseek(handle->fp, 0, SEEK_END) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+
+	const long local_offset_long = ftell(handle->fp);
+	if (local_offset_long < 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (local_offset_long > 0xFFFFFFFFL)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_UNSUPPORTED_FEATURE;
+	}
+	const uint32_t local_offset = (uint32_t)local_offset_long;
+
+	unsigned char local[30] = {0};
+	local[0] = 0x50; local[1] = 0x4b; local[2] = 0x03; local[3] = 0x04;
+	local[4] = 20; // version needed to extract
+	local[5] = 0;
+	// flags: 0
+	// compression: 0
+	// mod time/date: 0
+	local[14] = (unsigned char)(crc & 0xFF);
+	local[15] = (unsigned char)((crc >> 8) & 0xFF);
+	local[16] = (unsigned char)((crc >> 16) & 0xFF);
+	local[17] = (unsigned char)((crc >> 24) & 0xFF);
+	const uint32_t data_size32 = (uint32_t)data_size;
+	local[18] = (unsigned char)(data_size32 & 0xFF);
+	local[19] = (unsigned char)((data_size32 >> 8) & 0xFF);
+	local[20] = (unsigned char)((data_size32 >> 16) & 0xFF);
+	local[21] = (unsigned char)((data_size32 >> 24) & 0xFF);
+	local[22] = local[18];
+	local[23] = local[19];
+	local[24] = local[20];
+	local[25] = local[21];
+	local[26] = (unsigned char)(name_len & 0xFF);
+	local[27] = (unsigned char)((name_len >> 8) & 0xFF);
+	// extra length 0
+
+	if (!write_all(handle->fp, local, sizeof(local)))
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (!write_all(handle->fp, stream->path.data(), name_len))
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (fflush(handle->fp) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+
+	const int fd_in = fileno(stream->stream);
+	const int fd_out = fileno(handle->fp);
+	if (fd_in < 0 || fd_out < 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+	if (lseek(fd_in, 0, SEEK_SET) < 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+
+	remaining = data_size;
+	while (remaining > 0)
+	{
+		size_t chunk = remaining;
+		if (chunk > (1U << 30)) chunk = (1U << 30);
+		const ssize_t moved = copy_file_range(fd_in, nullptr, fd_out, nullptr, chunk, 0);
+		if (moved <= 0)
+		{
+			fclose(stream->stream);
+			if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+			delete stream;
+			return ZIPC_IO_FAILURE;
+		}
+		remaining -= (size_t)moved;
+	}
+	if (fseek(handle->fp, 0, SEEK_CUR) != 0)
+	{
+		fclose(stream->stream);
+		if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
+		delete stream;
+		return ZIPC_IO_FAILURE;
+	}
+
+	filenode node;
+	node.size = data_size;
+	node.data_offset = (size_t)local_offset + 30U + name_len;
+	node.local_offset = local_offset;
+	node.crc = crc;
+	handle->files.emplace(stream->path, node);
+
+	const enum zipc_status status = write_central_directory(handle);
+	if (status != ZIPC_SUCCESS) handle->files.erase(stream->path);
+
+	fclose(stream->stream);
+	if (!stream->temp_path.empty()) unlink(stream->temp_path.c_str());
 	delete stream;
-	return ZIPC_SUCCESS;
+	return status;
 }
 
 enum zipc_status zipc_validate(zipc* handle)
