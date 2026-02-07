@@ -100,7 +100,7 @@ int main(int argc, char** argv)
 	assert(map.size == strlen(content));
 	assert(strncmp(content, (const char*)map.data, map.size) == 0);
 	assert(((const char*)map.data)[map.size - 1] == content[strlen(content) - 1]);
-	zipc_unmap(z, map);
+	zipc_unmap_read(z, map);
 	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	zipc_close(z);
 
@@ -142,6 +142,35 @@ int main(int argc, char** argv)
 	test_punch_hole_support();
 #endif
 
+	// Map write zip file
+	const char* map_zip_filename = "mapwrite.zip";
+	z = zipc_open(map_zip_filename, "w", &r);
+	assert(r == ZIPC_SUCCESS);
+	assert(z);
+	const char* map_content = "Map write content";
+	const size_t map_max = 1024;
+	zipc_mapping map_write = zipc_map_write(z, "map.txt", &r, map_max);
+	assert(r == ZIPC_SUCCESS);
+	assert(map_write.data);
+	memcpy(map_write.data, map_content, strlen(map_content));
+	map_write.size = strlen(map_content);
+	r = zipc_unmap_write(z, map_write, map_write.size);
+	assert(r == ZIPC_SUCCESS);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
+	zipc_close(z);
+
+	z = zipc_open(map_zip_filename, "r", &r);
+	assert(r == ZIPC_SUCCESS);
+	assert(z);
+	assert(zipc_filesize(z, "map.txt") == (ssize_t)strlen(map_content));
+	char map_readback[128];
+	memset(map_readback, 0, sizeof(map_readback));
+	r = zipc_read(z, "map.txt", strlen(map_content), map_readback);
+	assert(r == ZIPC_SUCCESS);
+	assert(strncmp(map_content, map_readback, strlen(map_content)) == 0);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
+	zipc_close(z);
+
 	// Test existing zip files
 	z = zipc_open(TEXT_FILES_ZIP, "r", &r);
 	assert(z);
@@ -181,8 +210,6 @@ int main(int argc, char** argv)
 	z = zipc_open(ENCRYPTED_ZIP, "r", &r);
 	assert(z == nullptr);
 	assert(r == ZIPC_UNSUPPORTED_FEATURE);
-
-	// TBD test zipc_map with write mode
 
 	// TBD test zipc_stream_*() calls
 	//zipcstream* zipc_stream_open(zipc* handle, const char* path, const char* mode);

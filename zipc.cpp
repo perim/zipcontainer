@@ -42,6 +42,14 @@ struct zipc
 	std::unordered_map<std::string, filenode> files;
 	size_t central_dir_offset = 0;
 	bool central_dir_known = false;
+	bool map_write_active = false;
+	void* map_write_base = nullptr;
+	void* map_write_data = nullptr;
+	size_t map_write_length = 0;
+	size_t map_write_max = 0;
+	size_t map_write_data_offset = 0;
+	uint32_t map_write_local_offset = 0;
+	std::string map_write_path;
 };
 
 struct zipcstream
@@ -414,6 +422,11 @@ zipc* zipc_open(const char* filename, const char* mode, enum zipc_status* err)
 void zipc_close(zipc* handle)
 {
 	if (!handle) return;
+	assert(!handle->map_write_active);
+	if (handle->map_write_active && handle->map_write_base && handle->map_write_length)
+	{
+		munmap(handle->map_write_base, handle->map_write_length);
+	}
 	if (handle->fp) fclose(handle->fp);
 	delete handle;
 }
@@ -491,21 +504,230 @@ zipc_mapping zipc_map_read(zipc* handle, const char* path, enum zipc_status* err
 	return m;
 }
 
-void* zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size_t max)
+zipc_mapping zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size_t max)
 {
 	assert(handle);
 	assert(path);
-	// TBD
 	if (err) *err = ZIPC_SUCCESS;
-	return nullptr;
+	zipc_mapping mapping{};
+	if (!handle || !path)
+	{
+		if (err) *err = ZIPC_SYNTAX_ERROR;
+		return mapping;
+	}
+	if (handle->mode == ZIPC_READ_ONLY)
+	{
+		if (err) *err = ZIPC_PERMISSION_FAILURE;
+		return mapping;
+	}
+	if (!handle->fp)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+	if (handle->map_write_active)
+	{
+		if (err) *err = ZIPC_PERMISSION_FAILURE;
+		return mapping;
+	}
+	if (handle->files.count(path) != 0)
+	{
+		if (err) *err = ZIPC_PATH_ALREADY_EXISTS;
+		return mapping;
+	}
+
+	const size_t name_len = strlen(path);
+	if (name_len > 0xFFFF)
+	{
+		if (err) *err = ZIPC_UNSUPPORTED_FEATURE;
+		return mapping;
+	}
+	if (max > 0xFFFFFFFFULL)
+	{
+		if (err) *err = ZIPC_UNSUPPORTED_FEATURE;
+		return mapping;
+	}
+	if (max == 0)
+	{
+		const enum zipc_status st = zipc_write(handle, path, 0, nullptr);
+		if (err) *err = st;
+		if (st != ZIPC_SUCCESS) return mapping;
+		static char empty = 0;
+		mapping.data = &empty;
+		mapping.size = 0;
+		return mapping;
+	}
+
+	if (handle->central_dir_known)
+	{
+		if (fseek(handle->fp, (long)handle->central_dir_offset, SEEK_SET) != 0)
+		{
+			if (err) *err = ZIPC_IO_FAILURE;
+			return mapping;
+		}
+		const int fd = fileno(handle->fp);
+		if (fd >= 0 && ftruncate(fd, (off_t)handle->central_dir_offset) != 0)
+		{
+			if (err) *err = ZIPC_IO_FAILURE;
+			return mapping;
+		}
+	}
+	else if (fseek(handle->fp, 0, SEEK_END) != 0)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+
+	const long local_offset_long = ftell(handle->fp);
+	if (local_offset_long < 0 || local_offset_long > 0xFFFFFFFFL)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+	const uint32_t local_offset = (uint32_t)local_offset_long;
+
+	const uint32_t data_size32 = (uint32_t)max;
+	unsigned char local[30] = {0};
+	local[0] = 0x50; local[1] = 0x4b; local[2] = 0x03; local[3] = 0x04;
+	local[4] = 20; // version needed to extract
+	local[5] = 0;
+	// flags: 0
+	// compression: 0
+	// mod time/date: 0
+	// crc: 0 for now
+	local[18] = (unsigned char)(data_size32 & 0xFF);
+	local[19] = (unsigned char)((data_size32 >> 8) & 0xFF);
+	local[20] = (unsigned char)((data_size32 >> 16) & 0xFF);
+	local[21] = (unsigned char)((data_size32 >> 24) & 0xFF);
+	local[22] = local[18];
+	local[23] = local[19];
+	local[24] = local[20];
+	local[25] = local[21];
+	local[26] = (unsigned char)(name_len & 0xFF);
+	local[27] = (unsigned char)((name_len >> 8) & 0xFF);
+	// extra length 0
+
+	if (!write_all(handle->fp, local, sizeof(local)))
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+	if (!write_all(handle->fp, path, name_len))
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+
+	const size_t data_offset = (size_t)local_offset + 30U + name_len;
+	const size_t end_offset = data_offset + max;
+	const int fd = fileno(handle->fp);
+	if (fd < 0 || ftruncate(fd, (off_t)end_offset) != 0)
+	{
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+
+	const long pagesize_long = sysconf(_SC_PAGESIZE);
+	const size_t pagesize = pagesize_long > 0 ? (size_t)pagesize_long : 4096;
+	const size_t page_offset = data_offset % pagesize;
+	const size_t map_offset = data_offset - page_offset;
+	const size_t map_length = max + page_offset;
+
+	void* base = mmap(nullptr, map_length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
+	if (base == MAP_FAILED)
+	{
+		ftruncate(fd, (off_t)local_offset);
+		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+
+	void* user_ptr = static_cast<unsigned char*>(base) + page_offset;
+	handle->map_write_active = true;
+	handle->map_write_base = base;
+	handle->map_write_data = user_ptr;
+	handle->map_write_length = map_length;
+	handle->map_write_max = max;
+	handle->map_write_data_offset = data_offset;
+	handle->map_write_local_offset = local_offset;
+	handle->map_write_path = path;
+
+	if (err) *err = ZIPC_SUCCESS;
+	mapping.data = user_ptr;
+	mapping.size = max;
+	mapping.map_base = base;
+	mapping.map_length = map_length;
+	return mapping;
 }
 
-void zipc_unmap(zipc* handle, zipc_mapping mapping)
+void zipc_unmap_read(zipc* handle, zipc_mapping mapping)
 {
 	assert(handle);
-	(void)handle;
 	if (!mapping.map_base || mapping.map_length == 0) return;
 	munmap(const_cast<void*>(mapping.map_base), mapping.map_length);
+}
+
+enum zipc_status zipc_unmap_write(zipc* handle, zipc_mapping mapping, size_t size)
+{
+	assert(handle);
+	enum zipc_status status = ZIPC_SUCCESS;
+	if (!handle || !mapping.data) return ZIPC_SYNTAX_ERROR;
+	if (!handle->map_write_active) return ZIPC_SYNTAX_ERROR;
+	if (mapping.data != handle->map_write_data) return ZIPC_SYNTAX_ERROR;
+	if (size > handle->map_write_max) return ZIPC_SYNTAX_ERROR;
+	if (!handle->fp) return ZIPC_IO_FAILURE;
+
+	const uint32_t crc = crc32_calc(mapping.data, size);
+	if (munmap(handle->map_write_base, handle->map_write_length) != 0) status = ZIPC_IO_FAILURE;
+
+	const size_t end_offset = handle->map_write_data_offset + size;
+	if (size < handle->map_write_max)
+	{
+		const int fd = fileno(handle->fp);
+		if (fd >= 0 && ftruncate(fd, (off_t)end_offset) != 0) status = ZIPC_IO_FAILURE;
+	}
+
+	if (fseek(handle->fp, (long)handle->map_write_local_offset + 14, SEEK_SET) != 0) status = ZIPC_IO_FAILURE;
+	unsigned char header[12];
+	header[0] = (unsigned char)(crc & 0xFF);
+	header[1] = (unsigned char)((crc >> 8) & 0xFF);
+	header[2] = (unsigned char)((crc >> 16) & 0xFF);
+	header[3] = (unsigned char)((crc >> 24) & 0xFF);
+	const uint32_t size32 = (uint32_t)size;
+	header[4] = (unsigned char)(size32 & 0xFF);
+	header[5] = (unsigned char)((size32 >> 8) & 0xFF);
+	header[6] = (unsigned char)((size32 >> 16) & 0xFF);
+	header[7] = (unsigned char)((size32 >> 24) & 0xFF);
+	header[8] = header[4];
+	header[9] = header[5];
+	header[10] = header[6];
+	header[11] = header[7];
+	if (!write_all(handle->fp, header, sizeof(header))) status = ZIPC_IO_FAILURE;
+
+	if (fseek(handle->fp, (long)end_offset, SEEK_SET) != 0) status = ZIPC_IO_FAILURE;
+	filenode node;
+	node.size = size;
+	node.data_offset = handle->map_write_data_offset;
+	node.local_offset = handle->map_write_local_offset;
+	node.crc = crc;
+	handle->files.emplace(handle->map_write_path, node);
+
+	const enum zipc_status cd_status = write_central_directory(handle);
+	if (cd_status != ZIPC_SUCCESS)
+	{
+		handle->files.erase(handle->map_write_path);
+		if (status == ZIPC_SUCCESS) status = cd_status;
+	}
+
+	handle->map_write_active = false;
+	handle->map_write_base = nullptr;
+	handle->map_write_data = nullptr;
+	handle->map_write_length = 0;
+	handle->map_write_max = 0;
+	handle->map_write_data_offset = 0;
+	handle->map_write_local_offset = 0;
+	handle->map_write_path.clear();
+
+	return status;
 }
 
 enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const void* ptr)

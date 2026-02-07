@@ -43,7 +43,7 @@ enum zipc_status zipc_validate(zipc* handle);
 
 struct zipc_mapping
 {
-	const void* data;      // Pointer to file contents (read-only).
+	void* data;            // Pointer to file contents (read-only for map_read).
 	size_t size;           // Size of the file data.
 	const void* map_base;  // Base address of the mapping.
 	size_t map_length;     // Length passed to mmap().
@@ -60,12 +60,16 @@ zipc_mapping zipc_map_read(zipc* handle, const char* path, enum zipc_status* err
 /// way while having this memory map open. If `err` is not null, we will write status to
 /// it. `max` is the maximum size of the file - it is safe to set this to some outlandishly
 /// large value, but it needs to be a value that the virtual memory system can handle, so
-/// do not use the full UINT64_MAX. Returns null on failure.
-void* zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size_t max);
+/// do not use the full UINT64_MAX. Returns a struct describing the mapping; `data` will
+/// be null on failure.
+zipc_mapping zipc_map_write(zipc* handle, const char* path, enum zipc_status* err, size_t max);
 
-/// Unmap the memory mapped by `zipc_map_<type>`. Pass the mapping returned from
-/// `zipc_map_read`. This function is thread-safe.
-void zipc_unmap(zipc* handle, zipc_mapping mapping);
+/// Unmap the memory mapped by `zipc_map_read`. This function is thread-safe.
+void zipc_unmap_read(zipc* handle, zipc_mapping mapping);
+
+/// Finalize and unmap the memory mapped by `zipc_map_write`. `size` is the actual
+/// number of bytes written (must be <= max). Returns a status code.
+enum zipc_status zipc_unmap_write(zipc* handle, zipc_mapping mapping, size_t size);
 
 /// Create and write a new file inside the ZIP container.
 enum zipc_status zipc_write(zipc* handle, const char* path, size_t size, const void* ptr);
