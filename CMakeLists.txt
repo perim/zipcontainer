@@ -29,3 +29,12 @@ add_executable(stresstest tests/stresstest.cpp ${PROJECT_SOURCE_DIR}/zipc.cpp ${
 target_include_directories(stresstest PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_options(stresstest PRIVATE -Wall)
 add_test(NAME stresstest COMMAND ${CMAKE_CURRENT_BINARY_DIR}/stresstest)
+
+add_executable(zipcompare tools/zipcompare.cpp)
+target_link_libraries(zipcompare PRIVATE zipcontainer)
+target_include_directories(zipcompare PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_options(zipcompare PRIVATE -Wall)
+add_test(NAME zipcompare_same COMMAND ${CMAKE_CURRENT_BINARY_DIR}/zipcompare compare_first.zip compare_first.zip)
+set_tests_properties(zipcompare_same PROPERTIES FIXTURES_REQUIRED testfile_zip)
+add_test(NAME zipcompare_diff COMMAND ${CMAKE_CURRENT_BINARY_DIR}/zipcompare compare_first.zip compare_second.zip)
+set_tests_properties(zipcompare_diff PROPERTIES FIXTURES_REQUIRED testfile_zip WILL_FAIL TRUE)

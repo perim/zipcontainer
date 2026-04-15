@@ -7,7 +7,9 @@ extern "C" {
 #endif
 
 struct zipc;
+typedef struct zipc zipc;
 struct zipcstream;
+typedef struct zipcstream zipcstream;
 
 enum zipc_status
 {
@@ -20,6 +22,7 @@ enum zipc_status
 	ZIPC_UNSUPPORTED_FEATURE,
 	ZIPC_PATH_NOT_FOUND,
 };
+typedef enum zipc_status zipc_status;
 
 /// Return a string explaining one of our error codes.
 const char* zipc_strerror(zipc_status err);
@@ -48,6 +51,7 @@ struct zipc_mapping
 	const void* map_base;  // Base address of the mapping.
 	size_t map_length;     // Length passed to mmap().
 };
+typedef struct zipc_mapping zipc_mapping;
 
 /// Memory map a file inside the ZIP container for streaming read. Read once and then
 /// unmap it. The whole file will be mapped, get the size of the file with `zipc_filesize`.

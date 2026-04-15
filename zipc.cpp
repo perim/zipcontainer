@@ -1,9 +1,11 @@
 #include "zipc.h"
+#include "zipc_utility.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <limits.h>
 
 #include <cstdint>
 #include <algorithm>
@@ -1282,4 +1284,236 @@ enum zipc_status zipc_validate(zipc* handle)
 	}
 
 	return ZIPC_SUCCESS;
+}
+
+struct compare_diff
+{
+	std::string name;
+	enum zipc_diff_kind kind;
+	size_t size_first = 0;
+	size_t size_second = 0;
+	size_t offset_first_diff = 0;
+};
+
+static const zipc_comparison* zipc_compare_status(enum zipc_status status)
+{
+	zipc_comparison* c = (zipc_comparison*)malloc(sizeof(zipc_comparison));
+	if (!c) return nullptr;
+	c->status = status;
+	c->count = 0;
+	c->differences = nullptr;
+	return c;
+}
+
+static enum zipc_status zipc_find_first_difference(zipc* first, const filenode& first_node,
+	zipc* second, const filenode& second_node,
+	std::vector<unsigned char>& first_buf, std::vector<unsigned char>& second_buf,
+	size_t* offset_first_diff)
+{
+	assert(first);
+	assert(second);
+	assert(offset_first_diff);
+
+	*offset_first_diff = 0;
+	const size_t shared_size = std::min(first_node.size, second_node.size);
+	if (fseek(first->fp, (long)first_node.data_offset, SEEK_SET) != 0) return ZIPC_IO_FAILURE;
+	if (fseek(second->fp, (long)second_node.data_offset, SEEK_SET) != 0) return ZIPC_IO_FAILURE;
+
+	size_t compared = 0;
+	while (compared < shared_size)
+	{
+		const size_t chunk = std::min(shared_size - compared, first_buf.size());
+		if (!read_fully(first->fp, first_buf.data(), chunk)) return ZIPC_IO_FAILURE;
+		if (!read_fully(second->fp, second_buf.data(), chunk)) return ZIPC_IO_FAILURE;
+		if (memcmp(first_buf.data(), second_buf.data(), chunk) != 0)
+		{
+			for (size_t i = 0; i < chunk; ++i)
+			{
+				if (first_buf[i] != second_buf[i])
+				{
+					*offset_first_diff = compared + i;
+					return ZIPC_SUCCESS;
+				}
+			}
+		}
+		compared += chunk;
+	}
+
+	*offset_first_diff = shared_size;
+	return ZIPC_SUCCESS;
+}
+
+static const zipc_comparison* zipc_build_comparison(const std::vector<compare_diff>& differences)
+{
+	if (differences.size() > (size_t)INT_MAX) return zipc_compare_status(ZIPC_UNSUPPORTED_FEATURE);
+
+	size_t names_size = 0;
+	for (const compare_diff& diff : differences)
+	{
+		if (names_size > SIZE_MAX - diff.name.size() - 1) return zipc_compare_status(ZIPC_UNSUPPORTED_FEATURE);
+		names_size += diff.name.size() + 1;
+	}
+
+	const size_t count = differences.size();
+	const size_t array_align = alignof(zipc_file_diff);
+	size_t array_offset = sizeof(zipc_comparison);
+	if (array_offset % array_align != 0) array_offset += array_align - (array_offset % array_align);
+	if (count > 0 && count > (SIZE_MAX - array_offset) / sizeof(zipc_file_diff))
+	{
+		return zipc_compare_status(ZIPC_UNSUPPORTED_FEATURE);
+	}
+	const size_t names_offset = array_offset + count * sizeof(zipc_file_diff);
+	if (names_size > SIZE_MAX - names_offset) return zipc_compare_status(ZIPC_UNSUPPORTED_FEATURE);
+	const size_t total_size = names_offset + names_size;
+
+	zipc_comparison* comparison = (zipc_comparison*)malloc(total_size);
+	if (!comparison) return nullptr;
+
+	comparison->status = ZIPC_SUCCESS;
+	comparison->count = (int)count;
+	comparison->differences = nullptr;
+	if (count == 0) return comparison;
+
+	zipc_file_diff* diff_array = (zipc_file_diff*)((unsigned char*)comparison + array_offset);
+	char* names = (char*)comparison + names_offset;
+	comparison->differences = diff_array;
+
+	for (size_t i = 0; i < count; ++i)
+	{
+		const compare_diff& src = differences[i];
+		zipc_file_diff& dst = diff_array[i];
+		memcpy(names, src.name.c_str(), src.name.size() + 1);
+		dst.name = names;
+		dst.kind = src.kind;
+		dst.size_first = src.size_first;
+		dst.size_second = src.size_second;
+		dst.offset_first_diff = src.offset_first_diff;
+		names += src.name.size() + 1;
+	}
+
+	return comparison;
+}
+
+static const char* zipc_diff_kind_string(enum zipc_diff_kind kind)
+{
+	switch (kind)
+	{
+		case ZIPC_DIFF_CONTENT: return "content differs";
+		case ZIPC_DIFF_ONLY_IN_FIRST: return "only in first";
+		case ZIPC_DIFF_ONLY_IN_SECOND: return "only in second";
+		default: return "unknown difference";
+	}
+}
+
+/// Compare two zip files and list differences. You must call `zipc_compare_free()` on the
+/// return pointer once you are done with the data.
+const zipc_comparison* zipc_compare(const char* first, const char* second)
+{
+	if (!first || !second) return zipc_compare_status(ZIPC_SYNTAX_ERROR);
+
+	enum zipc_status status = ZIPC_SUCCESS;
+	zipc* first_zip = zipc_open(first, "r", &status);
+	if (!first_zip) return zipc_compare_status(status);
+
+	enum zipc_status second_status = ZIPC_SUCCESS;
+	zipc* second_zip = zipc_open(second, "r", &second_status);
+	if (!second_zip)
+	{
+		const enum zipc_status close_status = zipc_close(first_zip);
+		(void)close_status;
+		return zipc_compare_status(second_status);
+	}
+
+	std::vector<std::string> names;
+	names.reserve(first_zip->files.size() + second_zip->files.size());
+	for (const auto& kv : first_zip->files) names.push_back(kv.first);
+	for (const auto& kv : second_zip->files) names.push_back(kv.first);
+	std::sort(names.begin(), names.end());
+	names.erase(std::unique(names.begin(), names.end()), names.end());
+
+	std::vector<compare_diff> differences;
+	differences.reserve(names.size());
+	std::vector<unsigned char> first_buf(64 * 1024);
+	std::vector<unsigned char> second_buf(64 * 1024);
+
+	for (const std::string& name : names)
+	{
+		const auto first_it = first_zip->files.find(name);
+		const auto second_it = second_zip->files.find(name);
+		if (first_it == first_zip->files.end())
+		{
+			differences.push_back(compare_diff{name, ZIPC_DIFF_ONLY_IN_SECOND, 0, second_it->second.size, 0});
+			continue;
+		}
+		if (second_it == second_zip->files.end())
+		{
+			differences.push_back(compare_diff{name, ZIPC_DIFF_ONLY_IN_FIRST, first_it->second.size, 0, 0});
+			continue;
+		}
+
+		const filenode& first_node = first_it->second;
+		const filenode& second_node = second_it->second;
+		if (first_node.size == second_node.size && first_node.crc == second_node.crc) continue;
+
+		size_t offset_first_diff = 0;
+		status = zipc_find_first_difference(first_zip, first_node, second_zip, second_node,
+			first_buf, second_buf, &offset_first_diff);
+		if (status != ZIPC_SUCCESS) break;
+		if (first_node.size == second_node.size && offset_first_diff == first_node.size) continue;
+
+		differences.push_back(compare_diff{name, ZIPC_DIFF_CONTENT,
+			first_node.size, second_node.size, offset_first_diff});
+	}
+
+	const enum zipc_status first_close_status = zipc_close(first_zip);
+	const enum zipc_status second_close_status = zipc_close(second_zip);
+	if (status == ZIPC_SUCCESS && first_close_status != ZIPC_SUCCESS) status = first_close_status;
+	if (status == ZIPC_SUCCESS && second_close_status != ZIPC_SUCCESS) status = second_close_status;
+
+	if (status != ZIPC_SUCCESS) return zipc_compare_status(status);
+	return zipc_build_comparison(differences);
+}
+
+/// Convenience helper function to pretty print the contents of the `zipc_file_diff` array.
+void zipc_print_zipc_file_diff(const zipc_comparison* differences, FILE* out)
+{
+	if (!differences || !out) return;
+	if (differences->status != ZIPC_SUCCESS)
+	{
+		fprintf(out, "comparison failed: %s\n", zipc_strerror(differences->status));
+		return;
+	}
+	if (differences->count == 0)
+	{
+		fprintf(out, "no differences\n");
+		return;
+	}
+
+	for (int i = 0; i < differences->count; ++i)
+	{
+		const zipc_file_diff& diff = differences->differences[i];
+		const char* name = diff.name ? diff.name : "(null)";
+		switch (diff.kind)
+		{
+			case ZIPC_DIFF_CONTENT:
+				fprintf(out, "%s: %s at byte %zu (%zu vs %zu bytes)\n",
+					name, zipc_diff_kind_string(diff.kind),
+					diff.offset_first_diff, diff.size_first, diff.size_second);
+				break;
+			case ZIPC_DIFF_ONLY_IN_FIRST:
+			case ZIPC_DIFF_ONLY_IN_SECOND:
+				fprintf(out, "%s: %s (%zu vs %zu bytes)\n",
+					name, zipc_diff_kind_string(diff.kind),
+					diff.size_first, diff.size_second);
+				break;
+			default:
+				fprintf(out, "%s: %s\n", name, zipc_diff_kind_string(diff.kind));
+				break;
+		}
+	}
+}
+
+void zipc_compare_free(const zipc_comparison* differences)
+{
+	free((void*)differences);
 }

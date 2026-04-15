@@ -1,4 +1,5 @@
 #include "zipc.h"
+#include "zipc_utility.h"
 
 #include <assert.h>
 #include <errno.h>
@@ -62,6 +63,102 @@ static void test_punch_hole_support()
 	unlink(tmpl);
 }
 #endif
+
+struct test_entry
+{
+	const char* path;
+	const char* content;
+};
+
+static void create_test_archive(const char* filename, const test_entry* entries, size_t count)
+{
+	enum zipc_status status = ZIPC_SUCCESS;
+	zipc* z = zipc_open(filename, "w", &status);
+	assert(status == ZIPC_SUCCESS);
+	assert(z);
+	for (size_t i = 0; i < count; ++i)
+	{
+		status = zipc_write(z, entries[i].path, strlen(entries[i].content), entries[i].content);
+		assert(status == ZIPC_SUCCESS);
+	}
+	status = zipc_close(z);
+	assert(status == ZIPC_SUCCESS);
+}
+
+static const zipc_file_diff* find_diff(const zipc_comparison* comparison, const char* name)
+{
+	assert(comparison);
+	for (int i = 0; i < comparison->count; ++i)
+	{
+		if (strcmp(comparison->differences[i].name, name) == 0) return &comparison->differences[i];
+	}
+	return nullptr;
+}
+
+static void test_compare_utility()
+{
+	const test_entry first_entries[] = {
+		{"same.txt", "same content"},
+		{"diff.txt", "abcXef"},
+		{"only-first.txt", "first side"},
+		{"prefix.txt", "prefix"},
+	};
+	const test_entry second_entries[] = {
+		{"same.txt", "same content"},
+		{"diff.txt", "abcYef"},
+		{"only-second.txt", "second side"},
+		{"prefix.txt", "prefix and more"},
+	};
+
+	create_test_archive("compare_first.zip", first_entries, sizeof(first_entries) / sizeof(first_entries[0]));
+	create_test_archive("compare_second.zip", second_entries, sizeof(second_entries) / sizeof(second_entries[0]));
+
+	const zipc_comparison* comparison = zipc_compare("compare_first.zip", "compare_second.zip");
+	assert(comparison);
+	assert(comparison->status == ZIPC_SUCCESS);
+	assert(comparison->count == 4);
+
+	const zipc_file_diff* diff = find_diff(comparison, "diff.txt");
+	assert(diff);
+	assert(diff->kind == ZIPC_DIFF_CONTENT);
+	assert(diff->size_first == strlen("abcXef"));
+	assert(diff->size_second == strlen("abcYef"));
+	assert(diff->offset_first_diff == 3);
+
+	diff = find_diff(comparison, "only-first.txt");
+	assert(diff);
+	assert(diff->kind == ZIPC_DIFF_ONLY_IN_FIRST);
+	assert(diff->size_first == strlen("first side"));
+	assert(diff->size_second == 0);
+
+	diff = find_diff(comparison, "only-second.txt");
+	assert(diff);
+	assert(diff->kind == ZIPC_DIFF_ONLY_IN_SECOND);
+	assert(diff->size_first == 0);
+	assert(diff->size_second == strlen("second side"));
+
+	diff = find_diff(comparison, "prefix.txt");
+	assert(diff);
+	assert(diff->kind == ZIPC_DIFF_CONTENT);
+	assert(diff->size_first == strlen("prefix"));
+	assert(diff->size_second == strlen("prefix and more"));
+	assert(diff->offset_first_diff == strlen("prefix"));
+
+	assert(find_diff(comparison, "same.txt") == nullptr);
+	zipc_compare_free(comparison);
+
+	comparison = zipc_compare("compare_first.zip", "compare_first.zip");
+	assert(comparison);
+	assert(comparison->status == ZIPC_SUCCESS);
+	assert(comparison->count == 0);
+	assert(comparison->differences == nullptr);
+	zipc_compare_free(comparison);
+
+	comparison = zipc_compare(nullptr, "compare_second.zip");
+	assert(comparison);
+	assert(comparison->status == ZIPC_SYNTAX_ERROR);
+	zipc_compare_free(comparison);
+}
 
 int main(int argc, char** argv)
 {
@@ -145,6 +242,8 @@ int main(int argc, char** argv)
 #if defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
 	test_punch_hole_support();
 #endif
+
+	test_compare_utility();
 
 	// Map write zip file
 	const char* map_zip_filename = "mapwrite.zip";
