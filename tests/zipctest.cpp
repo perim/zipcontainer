@@ -11,6 +11,16 @@
 #include <unistd.h>
 #include <vector>
 
+#ifdef NDEBUG
+#if __clang__
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+#else
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#endif
+#endif
+
 #if defined(FALLOC_FL_PUNCH_HOLE) && defined(FALLOC_FL_KEEP_SIZE)
 static void test_punch_hole_support()
 {

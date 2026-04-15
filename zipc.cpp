@@ -636,7 +636,10 @@ zipc_mapping zipc_map_write(zipc* handle, const char* path, enum zipc_status* er
 	void* base = mmap(nullptr, map_length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, (off_t)map_offset);
 	if (base == MAP_FAILED)
 	{
-		ftruncate(fd, (off_t)local_offset);
+		if (ftruncate(fd, (off_t)local_offset) != 0)
+		{
+			// Preserve the original mmap failure status; this is only best-effort rollback.
+		}
 		if (err) *err = ZIPC_IO_FAILURE;
 		return mapping;
 	}

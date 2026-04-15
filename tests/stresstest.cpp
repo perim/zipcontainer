@@ -9,6 +9,16 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef NDEBUG
+#if __clang__
+#pragma clang diagnostic ignored "-Wunused-variable"
+#pragma clang diagnostic ignored "-Wunused-but-set-variable"
+#else
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#endif
+#endif
+
 static std::vector<unsigned char> make_data(std::mt19937& rng, size_t size)
 {
 	std::vector<unsigned char> data(size);
