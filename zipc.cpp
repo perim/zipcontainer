@@ -834,17 +834,6 @@ zipc_mapping zipc_map_write(zipc* handle, const char* path, enum zipc_status* er
 		if (err) *err = ZIPC_UNSUPPORTED_FEATURE;
 		return mapping;
 	}
-	if (max == 0)
-	{
-		const enum zipc_status st = zipc_write(handle, path, 0, nullptr);
-		if (err) *err = st;
-		if (st != ZIPC_SUCCESS) return mapping;
-		static char empty = 0;
-		mapping.data = &empty;
-		mapping.size = 0;
-		return mapping;
-	}
-
 	if (handle->central_dir_known)
 	{
 		if (!seek64(handle->fp, handle->central_dir_offset, SEEK_SET))
@@ -890,6 +879,26 @@ zipc_mapping zipc_map_write(zipc* handle, const char* path, enum zipc_status* er
 	if (fd < 0 || !to_off_t(end_offset, &end_off) || ftruncate(fd, end_off) != 0)
 	{
 		if (err) *err = ZIPC_IO_FAILURE;
+		return mapping;
+	}
+
+	if (max == 0)
+	{
+		static char empty = 0;
+		handle->map_write_active = true;
+		handle->map_write_base = nullptr;
+		handle->map_write_data = &empty;
+		handle->map_write_length = 0;
+		handle->map_write_max = 0;
+		handle->map_write_data_offset = data_offset;
+		handle->map_write_local_offset = local_offset;
+		handle->map_write_path = path;
+
+		if (err) *err = ZIPC_SUCCESS;
+		mapping.data = &empty;
+		mapping.size = 0;
+		mapping.map_base = nullptr;
+		mapping.map_length = 0;
 		return mapping;
 	}
 
@@ -959,7 +968,10 @@ enum zipc_status zipc_unmap_write(zipc* handle, zipc_mapping mapping, uint64_t s
 
 	enum zipc_status status = ZIPC_SUCCESS;
 	const uint32_t crc = crc32_calc(mapping.data, (size_t)size);
-	if (munmap(handle->map_write_base, handle->map_write_length) != 0) status = ZIPC_IO_FAILURE;
+	if (handle->map_write_length > 0 && munmap(handle->map_write_base, handle->map_write_length) != 0)
+	{
+		status = ZIPC_IO_FAILURE;
+	}
 
 	uint64_t end_offset = 0;
 	if (!add_u64(handle->map_write_data_offset, size, &end_offset)) status = ZIPC_UNSUPPORTED_FEATURE;

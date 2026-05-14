@@ -1,5 +1,4 @@
-ZIPC - an uncompressed zip file container library
-=================================================
+# ZIPC - an uncompressed zip file container library
 
 This is a very simple, high-performance library for reading and writing
 to uncompressed ZIP files, using them as containers for other files that
@@ -28,3 +27,10 @@ A quick example of how it can be used:
 	assert(result == ZIPC_SUCCESS);
 	zipc_close(fp);
 ```
+
+## To be done
+
+- Mutating writes are not transactional: `zipc_write`, `zipc_map_write`
+  / `zipc_unmap_write`, and `zipc_stream_close` may leave an existing
+  archive corrupted if an I/O failure occurs after the old central
+  directory has been truncated.

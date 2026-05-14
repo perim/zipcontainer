@@ -561,6 +561,13 @@ int main(int argc, char** argv)
 	r = zipc_unmap_write(z, map_write, map_write.size);
 	assert(r == ZIPC_SUCCESS);
 	assert(zipc_validate(z) == ZIPC_SUCCESS);
+	zipc_mapping empty_map_write = zipc_map_write(z, "empty-map.txt", &r, 0);
+	assert(r == ZIPC_SUCCESS);
+	assert(empty_map_write.data);
+	assert(empty_map_write.size == 0);
+	r = zipc_unmap_write(z, empty_map_write, 0);
+	assert(r == ZIPC_SUCCESS);
+	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	r = zipc_close(z);
 	assert(r == ZIPC_SUCCESS);
 
@@ -573,6 +580,9 @@ int main(int argc, char** argv)
 	r = zipc_read(z, "map.txt", strlen(map_content), map_readback);
 	assert(r == ZIPC_SUCCESS);
 	assert(strncmp(map_content, map_readback, strlen(map_content)) == 0);
+	assert(checked_filesize(z, "empty-map.txt") == 0);
+	r = zipc_read(z, "empty-map.txt", 0, nullptr);
+	assert(r == ZIPC_SUCCESS);
 	assert(zipc_validate(z) == ZIPC_SUCCESS);
 	r = zipc_close(z);
 	assert(r == ZIPC_SUCCESS);
