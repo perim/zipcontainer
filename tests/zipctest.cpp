@@ -659,6 +659,12 @@ static void test_compare_utility()
 	assert(zipc_extract_file("utility.zip", "utility.zip") == ZIPC_PATH_NOT_FOUND);
 	assert(file_size_on_disk("utility.zip") == utility_zip_size);
 
+	// Test path safety in zipc_extract_file and zipc_add_file
+	assert(zipc_extract_file("utility.zip", "../evil.txt") == ZIPC_SYNTAX_ERROR);
+	assert(zipc_extract_file("utility.zip", "/etc/passwd") == ZIPC_SYNTAX_ERROR);
+	assert(zipc_add_file("utility.zip", "../evil.txt") == ZIPC_SYNTAX_ERROR);
+	assert(zipc_add_file("utility.zip", "/etc/passwd") == ZIPC_SYNTAX_ERROR);
+
 	const zipc_comparison* comparison = zipc_compare("compare_first.zip", "compare_second.zip");
 	assert(comparison);
 	assert(comparison->status == ZIPC_SUCCESS);
