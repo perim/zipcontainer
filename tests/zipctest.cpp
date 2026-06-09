@@ -514,6 +514,53 @@ static void test_validate_rechecks_terminal_directory()
 	assert(status == ZIPC_SUCCESS);
 }
 
+static void test_stream_api_edge_cases()
+{
+	const char* stream_test_zip = "stream-edge-cases.zip";
+	unlink(stream_test_zip);
+
+	enum zipc_status r = ZIPC_SUCCESS;
+	zipc* z = zipc_open(stream_test_zip, "w", &r);
+	assert(z);
+	assert(r == ZIPC_SUCCESS);
+
+	// Invalid mode string
+	zipcstream* stream = zipc_stream_open(z, "test.txt", "w", &r);
+	assert(stream == nullptr);
+	assert(r == ZIPC_UNSUPPORTED_FEATURE);
+
+	// Valid stream open
+	stream = zipc_stream_open(z, "test.txt", "", &r);
+	assert(stream);
+	assert(r == ZIPC_SUCCESS);
+
+	// Write with null pointer but non-zero size
+	r = zipc_stream_write(z, stream, 10, nullptr);
+	assert(r == ZIPC_SYNTAX_ERROR);
+
+	// Write with zero size (should succeed and do nothing)
+	r = zipc_stream_write(z, stream, 0, nullptr);
+	assert(r == ZIPC_SUCCESS);
+
+	r = zipc_stream_close(z, stream);
+	assert(r == ZIPC_SUCCESS);
+
+	r = zipc_close(z);
+	assert(r == ZIPC_SUCCESS);
+
+	// Test opening stream in read-only mode
+	z = zipc_open(stream_test_zip, "r", &r);
+	assert(z);
+	assert(r == ZIPC_SUCCESS);
+	stream = zipc_stream_open(z, "readonly.txt", "", &r);
+	assert(stream == nullptr);
+	assert(r == ZIPC_PERMISSION_FAILURE);
+
+	r = zipc_close(z);
+	assert(r == ZIPC_SUCCESS);
+	unlink(stream_test_zip);
+}
+
 static void test_append_only_safety()
 {
 	const char* filename = "append-only.zip";
@@ -961,8 +1008,5 @@ int main(int argc, char** argv)
 	assert(z == nullptr);
 	assert(r == ZIPC_UNSUPPORTED_FEATURE);
 
-	// TBD test zipc_stream_*() calls
-	//zipcstream* zipc_stream_open(zipc* handle, const char* path, const char* mode);
-	//int zipc_stream_write(zipcstream* handle, const char* path, size_t size, void* ptr);
-	//int zipc_stream_close(zipcstream* handle);
+	test_stream_api_edge_cases();
 }
