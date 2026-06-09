@@ -1915,6 +1915,23 @@ static enum zipc_status zipc_file_open_status()
 	return ZIPC_IO_FAILURE;
 }
 
+static bool is_path_safe(const std::string& path)
+{
+	if (path.empty()) return false;
+	if (path[0] == '/') return false;
+	if (path.find('\\') != std::string::npos) return false;
+
+	if (path == ".." ||
+		path.find("../") == 0 ||
+		path.find("/../") != std::string::npos ||
+		(path.length() >= 3 && path.substr(path.length() - 3) == "/.."))
+	{
+		return false;
+	}
+
+	return true;
+}
+
 static std::string zipc_temp_path_for(const std::string& path)
 {
 	const size_t slash = path.find_last_of('/');
@@ -1943,6 +1960,7 @@ static std::string zipc_temp_path_for(const std::string& path)
 enum zipc_status zipc_add_file(const std::string& zipname, const std::string& targetFile)
 {
 	if (zipname.empty() || targetFile.empty()) return ZIPC_SYNTAX_ERROR;
+	if (!is_path_safe(targetFile)) return ZIPC_SYNTAX_ERROR;
 
 	FILE* input = fopen(targetFile.c_str(), "rb");
 	if (!input) return zipc_file_open_status();
@@ -2001,6 +2019,7 @@ enum zipc_status zipc_add_file(const std::string& zipname, const std::string& ta
 enum zipc_status zipc_extract_file(const std::string& zipname, const std::string& targetFile)
 {
 	if (zipname.empty() || targetFile.empty()) return ZIPC_SYNTAX_ERROR;
+	if (!is_path_safe(targetFile)) return ZIPC_SYNTAX_ERROR;
 	if (zipname == targetFile) return ZIPC_PATH_NOT_FOUND;
 
 	enum zipc_status status = ZIPC_SUCCESS;
